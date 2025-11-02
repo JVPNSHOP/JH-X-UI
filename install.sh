@@ -1,9 +1,6 @@
 #!/bin/bash
 # x-ui helper (tri-color UI, manual creds, menu edit, email notify)
-# Changes:
-# - Password prompts are now VISIBLE (use `read -rp` instead of hidden `-rsp`)
-# - At script end, a concise Panel Summary (URL / user / pass / port) is printed
-#   automatically if credentials were set in this run.
+# This build: tri-color banners (force-able), visible password prompts, exit summary with pause.
 
 # Usage:
 #   bash xui-helper.sh           # menu (default)
@@ -13,34 +10,37 @@
 #   bash xui-helper.sh email-test
 
 # ------------- Colors & UI -------------
-# Basic
 plain='\033[0m'
 red='\033[0;31m'
 blue='\033[0;34m'
 yellow='\033[0;33m'
 
-# 256-color tri palette (falls back automatically on non-256 terminals)
+# 256-color tri palette
 tri1='\033[38;5;39m'    # blue-ish
 tri2='\033[38;5;226m'   # yellow
 tri3='\033[38;5;201m'   # magenta
+green='\033[0;32m'      # fallback single color
+
+# Force tri color even if TERM says no (can override in /etc/xui-helper.conf)
+FORCE_TRI="1"
 
 supports_256() {
-  # crude check: $TERM supports 256 or COLORTERM truecolor
-  if [[ "$TERM" =~ 256color ]] || [[ "$COLORTERM" =~ truecolor|24bit ]]; then return 0; fi
+  # If FORCE_TRI is set, always return 0
+  if [[ "$FORCE_TRI" == "1" ]]; then return 0; fi
+  if [[ "$TERM" =~ 256color ]] || [[ "$COLORTERM" =~ (truecolor|24bit) ]]; then return 0; fi
   return 1
 }
 
 tri_echo() {
   local msg="$*"
   if supports_256; then
-    # split into three roughly equal parts
     local len=${#msg}
     local a=$((len/3))
     local b=$((2*len/3))
     echo -e "${tri1}${msg:0:$a}${tri2}${msg:$a:$((b-a))}${tri3}${msg:$b}${plain}"
   else
-    # fallback: blue > yellow > magenta markers
-    echo -e "${blue}${msg}${plain}"
+    # fallback: single green
+    echo -e "${green}${msg}${plain}"
   fi
 }
 
@@ -52,15 +52,14 @@ banner() {
 }
 
 # ------------- Globals & Config -------------
-CUR_DIR=$(pwd)
 CONF_FILE="/etc/xui-helper.conf"
 
 # defaults (can be overridden by CONF_FILE)
 EMAIL_ENABLED="true"
-EMAIL_TO="juevpn@gmail.com"   # requested default; can be changed in menu
+EMAIL_TO="juevpn@gmail.com"
 IP_OVERRIDE=""
 
-# last-set credentials (kept so script can print a final summary)
+# last-set credentials for exit summary
 LAST_XUI_USER=""
 LAST_XUI_PASS=""
 LAST_XUI_PORT=""
@@ -77,6 +76,7 @@ cat > "$CONF_FILE" <<EOF
 EMAIL_ENABLED="$EMAIL_ENABLED"
 EMAIL_TO="$EMAIL_TO"
 IP_OVERRIDE="$IP_OVERRIDE"
+FORCE_TRI="$FORCE_TRI"
 EOF
 chmod 600 "$CONF_FILE" || true
 }
@@ -212,24 +212,25 @@ show_current_settings() {
   "$xui_bin" setting -show true
 }
 
-# Print final summary at script end (only if creds set)
+# Exit summary (keeps on screen for copy)
 print_panel_link() {
   if [[ -n "$LAST_XUI_USER" && -n "$LAST_XUI_PASS" && -n "$LAST_XUI_PORT" ]]; then
     local ip
     ip=$(get_server_ip)
     echo
-    echo "========================================"
-    echo "x-ui panel summary"
-    echo "Access URL: http://${ip}:${LAST_XUI_PORT}/"
-    echo "Username:   ${LAST_XUI_USER}"
-    echo "Password:   ${LAST_XUI_PASS}"
-    echo "Port:       ${LAST_XUI_PORT}"
-    echo "========================================"
+    tri_echo "========================================"
+    tri_echo "x-ui panel summary"
+    tri_echo "Access URL: http://${ip}:${LAST_XUI_PORT}/"
+    tri_echo "Username:   ${LAST_XUI_USER}"
+    tri_echo "Password:   ${LAST_XUI_PASS}"
+    tri_echo "Port:       ${LAST_XUI_PORT}"
+    tri_echo "========================================"
     echo
+    if [[ -t 1 ]]; then
+      read -rp $'Press Enter to continue (copy first if you need)...' _d
+    fi
   fi
 }
-
-# ensure final summary prints even on early exits
 trap 'print_panel_link' EXIT
 
 set_creds_no_reset() {
@@ -242,7 +243,7 @@ set_creds_no_reset() {
   read -rp "New username: " U
   while [[ -z "$U" ]]; do read -rp "Username cannot be empty. New username: " U; done
 
-  # VISIBLE password input
+  # Visible password input
   read -rp "New password: " P; echo
   while [[ -z "$P" ]]; do read -rp "Password cannot be empty. New password: " P; echo; done
 
@@ -253,7 +254,6 @@ set_creds_no_reset() {
   "$xui_bin" setting -username "$U" -password "$P" -port "$NEWPORT" -webBasePath ""
   if command -v systemctl >/dev/null 2>&1; then systemctl restart x-ui || true; else rc-service x-ui restart || true; fi
 
-  # save to globals for final printing
   LAST_XUI_USER="$U"
   LAST_XUI_PASS="$P"
   LAST_XUI_PORT="$NEWPORT"
@@ -265,7 +265,6 @@ set_creds_no_reset() {
 }
 
 reset_panel() {
-  # legacy random reset (kept for explicit use)
   local U; U=$(gen_random_string 10)
   local P; P=$(gen_random_string 14)
   local PORT; PORT=$(shuf -i 1024-62000 -n 1)
@@ -280,21 +279,18 @@ reset_panel() {
   tri_echo "Access:   http://${ip}:${PORT}/"
   send_creds_email "$U" "$P" "$PORT"
 
-  # store for final summary
   LAST_XUI_USER="$U"
   LAST_XUI_PASS="$P"
   LAST_XUI_PORT="$PORT"
 }
 
 config_after_install_manual() {
-  # ensure webBasePath empty
   "$xui_bin" setting -webBasePath "" >/dev/null 2>&1 || true
 
   banner "Fresh install — set your own username/password/port"
   read -rp "Username: " U
   while [[ -z "$U" ]]; do read -rp "Username cannot be empty. Username: " U; done
 
-  # VISIBLE password input
   read -rp "Password: " P; echo
   while [[ -z "$P" ]]; do read -rp "Password cannot be empty. Password: " P; echo; done
 
@@ -320,12 +316,10 @@ config_after_install_manual() {
   tri_echo "Port:     $PORT"
   tri_echo "Access:   http://${ip}:${PORT}/"
 
-  # save last-set creds for final printout
   LAST_XUI_USER="$U"
   LAST_XUI_PASS="$P"
   LAST_XUI_PORT="$PORT"
 
-  # auto email (default ON, can be changed in menu)
   send_creds_email "$U" "$P" "$PORT"
 }
 
@@ -333,7 +327,6 @@ install_xui() {
   local release; release="$(detect_os)"
   cd /usr/local/ || exit 1
 
-  # fetch latest
   local tag_version
   tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
   if [[ -z "$tag_version" ]]; then
@@ -344,7 +337,6 @@ install_xui() {
   wget --inet4-only -N -O /usr/local/x-ui-linux-$(arch).tar.gz "https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz" || { echo -e "${red}Download failed.${plain}"; exit 1; }
   wget --inet4-only -O /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh || { echo -e "${red}Failed to download x-ui.sh${plain}"; exit 1; }
 
-  # stop & clean
   if [[ -e /usr/local/x-ui/ ]]; then
     if [[ "$release" == "alpine" ]]; then rc-service x-ui stop || true; else systemctl stop x-ui || true; fi
     rm -rf /usr/local/x-ui/
@@ -389,6 +381,9 @@ configure_notifications() {
 
   read -rp "Override IP/Host for access URL (blank = auto-detect, current: ${IP_OVERRIDE:-none}): " ipov
   [[ -n "$ipov" ]] && IP_OVERRIDE="$ipov"
+
+  read -rp "Force tri-color banners? (1=yes, 0=no) [current: ${FORCE_TRI}]: " ft
+  [[ -n "$ft" ]] && FORCE_TRI="$ft"
 
   save_config
   tri_echo "Saved."
