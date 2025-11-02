@@ -1,47 +1,27 @@
 #!/bin/bash
-# x-ui helper (tri-color UI, manual creds, menu edit, email notify)
-# This build: tri-color banners (force-able), visible password prompts, exit summary with pause.
+# x-ui helper (Tri-color CLI • Manual Creds • Email Notify • Copy-safe Summary • jue-menu)
+# - Always tri-color (basic ANSI: blue/yellow/magenta) in terminal
+# - Visible password prompts
+# - Summary stays on screen + saved to /root/xui-last.txt
+# - Installs global shortcut: `jue-menu` for quick creds menu
 
-# Usage:
-#   bash xui-helper.sh           # menu (default)
-#   bash xui-helper.sh install   # direct install/update
-#   bash xui-helper.sh set-cred  # change username/password/port without reset
-#   bash xui-helper.sh reset     # randomize creds/port (legacy reset)
-#   bash xui-helper.sh email-test
+set -euo pipefail
 
-# ------------- Colors & UI -------------
+# ------------- Colors & UI (CLI only) -------------
 plain='\033[0m'
 red='\033[0;31m'
-blue='\033[0;34m'
 yellow='\033[0;33m'
 
-# 256-color tri palette
-tri1='\033[38;5;39m'    # blue-ish
-tri2='\033[38;5;226m'   # yellow
-tri3='\033[38;5;201m'   # magenta
-green='\033[0;32m'      # fallback single color
-
-# Force tri color even if TERM says no (can override in /etc/xui-helper.conf)
-FORCE_TRI="1"
-
-supports_256() {
-  # If FORCE_TRI is set, always return 0
-  if [[ "$FORCE_TRI" == "1" ]]; then return 0; fi
-  if [[ "$TERM" =~ 256color ]] || [[ "$COLORTERM" =~ (truecolor|24bit) ]]; then return 0; fi
-  return 1
-}
+# basic 8-color (works on most terminals)
+tri1='\033[0;34m'   # blue
+tri2='\033[0;33m'   # yellow
+tri3='\033[0;35m'   # magenta
 
 tri_echo() {
   local msg="$*"
-  if supports_256; then
-    local len=${#msg}
-    local a=$((len/3))
-    local b=$((2*len/3))
-    echo -e "${tri1}${msg:0:$a}${tri2}${msg:$a:$((b-a))}${tri3}${msg:$b}${plain}"
-  else
-    # fallback: single green
-    echo -e "${green}${msg}${plain}"
-  fi
+  local len=${#msg}; local a=$((len/3)); local b=$((2*len/3))
+  # always 3 colors (no terminal capability check)
+  echo -e "${tri1}${msg:0:$a}${tri2}${msg:$a:$((b-a))}${tri3}${msg:$b}${plain}"
 }
 
 banner() {
@@ -53,18 +33,26 @@ banner() {
 
 # ------------- Globals & Config -------------
 CONF_FILE="/etc/xui-helper.conf"
-
-# defaults (can be overridden by CONF_FILE)
 EMAIL_ENABLED="true"
 EMAIL_TO="juevpn@gmail.com"
 IP_OVERRIDE=""
+SUMMARY_FILE="/root/xui-last.txt"
 
-# last-set credentials for exit summary
 LAST_XUI_USER=""
 LAST_XUI_PASS=""
 LAST_XUI_PORT=""
 
-# Load config if exists
+# Resolve script absolute path (portable)
+resolve_path() {
+  local p="$1"
+  if command -v readlink >/dev/null 2>&1; then readlink -f "$p" 2>/dev/null || echo "$p"
+  elif command -v realpath >/dev/null 2>&1; then realpath "$p" 2>/dev/null || echo "$p"
+  else echo "$p"
+  fi
+}
+SCRIPT_PATH="$(resolve_path "$0")"
+
+# Load persisted config (optional)
 if [[ -f "$CONF_FILE" ]]; then
   # shellcheck source=/dev/null
   source "$CONF_FILE"
@@ -76,24 +64,23 @@ cat > "$CONF_FILE" <<EOF
 EMAIL_ENABLED="$EMAIL_ENABLED"
 EMAIL_TO="$EMAIL_TO"
 IP_OVERRIDE="$IP_OVERRIDE"
-FORCE_TRI="$FORCE_TRI"
 EOF
 chmod 600 "$CONF_FILE" || true
 }
 
 # ------------- Root & OS -------------
-[[ $EUID -ne 0 ]] && echo -e "${red}Fatal error:${plain} Please run this script with root privilege.\n" && exit 1
+if [[ $EUID -ne 0 ]]; then
+  echo -e "${red}Fatal error:${plain} Please run this script as root.\n"; exit 1
+fi
 
 detect_os() {
   local release=""
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
-    source /etc/os-release
-    release=$ID
+    source /etc/os-release; release=$ID
   elif [[ -f /usr/lib/os-release ]]; then
     # shellcheck disable=SC1091
-    source /usr/lib/os-release
-    release=$ID
+    source /usr/lib/os-release; release=$ID
   else
     echo "Failed to detect OS."; exit 1
   fi
@@ -114,8 +101,7 @@ arch() {
 }
 
 install_base() {
-  local release
-  release="$(detect_os)"
+  local release; release="$(detect_os)"
   case "$release" in
     ubuntu|debian|armbian) apt-get update && apt-get install -y -q wget curl tar tzdata ca-certificates gnupg mailutils msmtp-mta || true ;;
     centos|rhel|almalinux|rocky|ol) yum -y update && yum install -y -q wget curl tar tzdata ca-certificates mailx msmtp || true ;;
@@ -134,19 +120,11 @@ gen_random_string() {
 
 # ------------- Network helpers -------------
 get_server_ip() {
-  if [[ -n "$IP_OVERRIDE" ]]; then
-    echo "$IP_OVERRIDE"; return
-  fi
-  local urls=(
-    "https://api4.ipify.org"
-    "https://ipv4.icanhazip.com"
-    "https://v4.api.ipinfo.io/ip"
-    "https://ipv4.myexternalip.com/raw"
-    "https://4.ident.me"
-  )
+  if [[ -n "$IP_OVERRIDE" ]]; then echo "$IP_OVERRIDE"; return; fi
+  local urls=("https://api4.ipify.org" "https://ipv4.icanhazip.com" "https://v4.api.ipinfo.io/ip" "https://ipv4.myexternalip.com/raw" "https://4.ident.me")
   local ip=""
   for u in "${urls[@]}"; do
-    ip=$(curl -fsS --max-time 3 "$u" 2>/dev/null | tr -d '[:space:]')
+    ip=$(curl -fsS --max-time 3 "$u" 2>/dev/null | tr -d '[:space:]') || true
     [[ -n "$ip" ]] && break
   done
   [[ -z "$ip" ]] && ip="SERVER_IP"
@@ -159,30 +137,14 @@ _have_cmd() { command -v "$1" >/dev/null 2>&1; }
 send_mail() {
   local subject="$1"; shift
   local body="$*"
-
   [[ "$EMAIL_ENABLED" != "true" ]] && return 0
   [[ -z "$EMAIL_TO" ]] && return 0
-
-  if _have_cmd mail; then
-    echo -e "$body" | mail -s "$subject" "$EMAIL_TO" && return 0
-  fi
+  if _have_cmd mail; then echo -e "$body" | mail -s "$subject" "$EMAIL_TO" && return 0; fi
   if _have_cmd sendmail; then
-    {
-      echo "Subject: $subject"
-      echo "To: $EMAIL_TO"
-      echo "Content-Type: text/plain; charset=UTF-8"
-      echo
-      echo -e "$body"
-    } | sendmail -t && return 0
+    { echo "Subject: $subject"; echo "To: $EMAIL_TO"; echo "Content-Type: text/plain; charset=UTF-8"; echo; echo -e "$body"; } | sendmail -t && return 0
   fi
   if _have_cmd msmtp; then
-    {
-      echo "Subject: $subject"
-      echo "To: $EMAIL_TO"
-      echo "Content-Type: text/plain; charset=UTF-8"
-      echo
-      echo -e "$body"
-    } | msmtp "$EMAIL_TO" && return 0
+    { echo "Subject: $subject"; echo "To: $EMAIL_TO"; echo "Content-Type: text/plain; charset=UTF-8"; echo; echo -e "$body"; } | msmtp "$EMAIL_TO" && return 0
   fi
   echo -e "${yellow}Email tools not configured (mail/sendmail/msmtp). Skipping email send.${plain}"
   return 1
@@ -206,62 +168,51 @@ Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
 xui_bin="/usr/local/x-ui/x-ui"
 
 show_current_settings() {
-  if [[ ! -x "$xui_bin" ]]; then
-    echo -e "${yellow}x-ui binary not found. Install first.${plain}"; return
-  fi
+  if [[ ! -x "$xui_bin" ]]; then echo -e "${yellow}x-ui binary not found. Install first.${plain}"; return; fi
   "$xui_bin" setting -show true
 }
 
-# Exit summary (keeps on screen for copy)
-print_panel_link() {
-  if [[ -n "$LAST_XUI_USER" && -n "$LAST_XUI_PASS" && -n "$LAST_XUI_PORT" ]]; then
-    local ip
-    ip=$(get_server_ip)
-    echo
-    tri_echo "========================================"
-    tri_echo "x-ui panel summary"
-    tri_echo "Access URL: http://${ip}:${LAST_XUI_PORT}/"
-    tri_echo "Username:   ${LAST_XUI_USER}"
-    tri_echo "Password:   ${LAST_XUI_PASS}"
-    tri_echo "Port:       ${LAST_XUI_PORT}"
-    tri_echo "========================================"
-    echo
-    if [[ -t 1 ]]; then
-      read -rp $'Press Enter to continue (copy first if you need)...' _d
-    fi
-  fi
-}
-trap 'print_panel_link' EXIT
-
-set_creds_no_reset() {
-  if [[ ! -x "$xui_bin" ]]; then
-    echo -e "${red}x-ui not installed yet.${plain}"; return 1
-  fi
+write_summary_and_pause() {
+  local ip; ip=$(get_server_ip)
+  local url="http://${ip}:${LAST_XUI_PORT}/"
+  {
+    echo "x-ui panel summary"
+    echo "Access URL: ${url}"
+    echo "Username:   ${LAST_XUI_USER}"
+    echo "Password:   ${LAST_XUI_PASS}"
+    echo "Port:       ${LAST_XUI_PORT}"
+    echo "Saved:      $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+  } > "$SUMMARY_FILE"
+  chmod 600 "$SUMMARY_FILE" || true
 
   echo
-  banner "Change x-ui Credentials (NO RESET)"
-  read -rp "New username: " U
-  while [[ -z "$U" ]]; do read -rp "Username cannot be empty. New username: " U; done
+  tri_echo "========================================"
+  tri_echo "x-ui panel summary"
+  tri_echo "Access URL: ${url}"
+  tri_echo "Username:   ${LAST_XUI_USER}"
+  tri_echo "Password:   ${LAST_XUI_PASS}"
+  tri_echo "Port:       ${LAST_XUI_PORT}"
+  tri_echo "File copy:  ${SUMMARY_FILE}"
+  tri_echo "========================================"
+  echo
+  if [[ -t 1 ]]; then read -rp $'Press Enter to continue (copy first if you need)...' _d; fi
+}
 
-  # Visible password input
-  read -rp "New password: " P; echo
-  while [[ -z "$P" ]]; do read -rp "Password cannot be empty. New password: " P; echo; done
-
+set_creds_no_reset() {
+  if [[ ! -x "$xui_bin" ]]; then echo -e "${red}x-ui not installed yet.${plain}"; return 1; fi
+  echo; banner "Change x-ui Credentials (NO RESET)"
+  read -rp "New username: " U; while [[ -z "$U" ]]; do read -rp "Username cannot be empty. New username: " U; done
+  read -rp "New password: " P; echo; while [[ -z "$P" ]]; do read -rp "Password cannot be empty. New password: " P; echo; done
   read -rp "New panel port (leave blank = keep current): " NEWPORT
-  local cur_port=$("$xui_bin" setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
-  [[ -z "$NEWPORT" ]] && NEWPORT="$cur_port"
+  local cur_port=$("$xui_bin" setting -show true | grep -Eo 'port: .+' | awk '{print $2}') || true
+  [[ -z "${NEWPORT:-}" ]] && NEWPORT="${cur_port:-2053}"
 
   "$xui_bin" setting -username "$U" -password "$P" -port "$NEWPORT" -webBasePath ""
   if command -v systemctl >/dev/null 2>&1; then systemctl restart x-ui || true; else rc-service x-ui restart || true; fi
 
-  LAST_XUI_USER="$U"
-  LAST_XUI_PASS="$P"
-  LAST_XUI_PORT="$NEWPORT"
-
+  LAST_XUI_USER="$U"; LAST_XUI_PASS="$P"; LAST_XUI_PORT="$NEWPORT"
   tri_echo "✓ Credentials updated successfully."
-  local ip; ip=$(get_server_ip)
-  tri_echo "Access URL: http://${ip}:${NEWPORT}/"
-  send_creds_email "$U" "$P" "$NEWPORT"
+  write_summary_and_pause
 }
 
 reset_panel() {
@@ -271,180 +222,154 @@ reset_panel() {
   if [[ ! -x "$xui_bin" ]]; then echo -e "${red}x-ui binary not found. Install first.${plain}"; exit 1; fi
   "$xui_bin" setting -username "$U" -password "$P" -port "$PORT" -webBasePath ""
   if command -v systemctl >/dev/null 2>&1; then systemctl restart x-ui || true; else rc-service x-ui restart || true; fi
-  local ip; ip=$(get_server_ip)
-  banner "Randomized Credentials"
-  tri_echo "Username: $U"
-  tri_echo "Password: $P"
-  tri_echo "Port:     $PORT"
-  tri_echo "Access:   http://${ip}:${PORT}/"
-  send_creds_email "$U" "$P" "$PORT"
 
-  LAST_XUI_USER="$U"
-  LAST_XUI_PASS="$P"
-  LAST_XUI_PORT="$PORT"
+  LAST_XUI_USER="$U"; LAST_XUI_PASS="$P"; LAST_XUI_PORT="$PORT"
+  banner "Randomized Credentials"
+  write_summary_and_pause
+  send_creds_email "$U" "$P" "$PORT"
 }
 
 config_after_install_manual() {
   "$xui_bin" setting -webBasePath "" >/dev/null 2>&1 || true
-
   banner "Fresh install — set your own username/password/port"
-  read -rp "Username: " U
-  while [[ -z "$U" ]]; do read -rp "Username cannot be empty. Username: " U; done
-
-  read -rp "Password: " P; echo
-  while [[ -z "$P" ]]; do read -rp "Password cannot be empty. Password: " P; echo; done
-
+  read -rp "Username: " U; while [[ -z "$U" ]]; do read -rp "Username cannot be empty. Username: " U; done
+  read -rp "Password: " P; echo; while [[ -z "$P" ]]; do read -rp "Password cannot be empty. Password: " P; echo; done
   read -rp "Panel port (e.g., 2053) [leave blank = random]: " PORT
-  if [[ -z "$PORT" ]]; then PORT=$(shuf -i 1024-62000 -n 1); fi
+  if [[ -z "${PORT:-}" ]]; then PORT=$(shuf -i 1024-62000 -n 1); fi
 
   "$xui_bin" setting -username "$U" -password "$P" -port "$PORT" -webBasePath ""
   "$xui_bin" migrate || true
 
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload
-    systemctl enable x-ui
-    systemctl restart x-ui
+    systemctl daemon-reload; systemctl enable x-ui; systemctl restart x-ui
   else
-    rc-update add x-ui || true
-    rc-service x-ui restart || true
+    rc-update add x-ui || true; rc-service x-ui restart || true
   fi
 
-  local ip; ip=$(get_server_ip)
+  LAST_XUI_USER="$U"; LAST_XUI_PASS="$P"; LAST_XUI_PORT="$PORT"
   banner "x-ui ready"
-  tri_echo "Username: $U"
-  tri_echo "Password: $P"
-  tri_echo "Port:     $PORT"
-  tri_echo "Access:   http://${ip}:${PORT}/"
-
-  LAST_XUI_USER="$U"
-  LAST_XUI_PASS="$P"
-  LAST_XUI_PORT="$PORT"
-
+  write_summary_and_pause
   send_creds_email "$U" "$P" "$PORT"
 }
 
 install_xui() {
-  local release; release="$(detect_os)"
-  cd /usr/local/ || exit 1
-
+  local release; release="$(detect_os)"; cd /usr/local/ || exit 1
   local tag_version
-  tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+  tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/') || true
   if [[ -z "$tag_version" ]]; then
     tag_version=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     [[ -z "$tag_version" ]] && { echo -e "${red}Failed to fetch x-ui version.${plain}"; exit 1; }
   fi
   banner "Installing 3x-ui ${tag_version}"
-  wget --inet4-only -N -O /usr/local/x-ui-linux-$(arch).tar.gz "https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz" || { echo -e "${red}Download failed.${plain}"; exit 1; }
-  wget --inet4-only -O /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh || { echo -e "${red}Failed to download x-ui.sh${plain}"; exit 1; }
+  wget --inet4-only -N -O /usr/local/x-ui-linux-$(arch).tar.gz "https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
+  wget --inet4-only -O /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
 
+  # stop & clean
   if [[ -e /usr/local/x-ui/ ]]; then
     if [[ "$release" == "alpine" ]]; then rc-service x-ui stop || true; else systemctl stop x-ui || true; fi
     rm -rf /usr/local/x-ui/
   fi
 
-  tar zxvf "x-ui-linux-$(arch).tar.gz"
-  rm -f "x-ui-linux-$(arch).tar.gz"
+  tar zxvf "x-ui-linux-$(arch).tar.gz"; rm -f "x-ui-linux-$(arch).tar.gz"
   cd x-ui || exit 1
   chmod +x x-ui x-ui.sh
   if [[ $(arch) == armv5 || $(arch) == armv6 || $(arch) == armv7 ]]; then
-    mv bin/xray-linux-$(arch) bin/xray-linux-arm
-    chmod +x bin/xray-linux-arm
+    mv bin/xray-linux-$(arch) bin/xray-linux-arm; chmod +x bin/xray-linux-arm
   fi
   chmod +x x-ui bin/xray-linux-$(arch)
-
-  mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
-  chmod +x /usr/bin/x-ui
+  mv -f /usr/bin/x-ui-temp /usr/bin/x-ui; chmod +x /usr/bin/x-ui
 
   if [[ "$release" == "alpine" ]]; then
-    wget --inet4-only -O /etc/init.d/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.rc || { echo -e "${red}Failed to download x-ui.rc${plain}"; exit 1; }
-    chmod +x /etc/init.d/x-ui
-    rc-update add x-ui || true
+    wget --inet4-only -O /etc/init.d/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.rc
+    chmod +x /etc/init.d/x-ui; rc-update add x-ui || true
   else
-    cp -f x-ui.service /etc/systemd/system/
-    systemctl daemon-reload
-    systemctl enable x-ui
+    cp -f x-ui.service /etc/systemd/system/; systemctl daemon-reload; systemctl enable x-ui
   fi
 
   tri_echo "x-ui ${tag_version} files installed."
   config_after_install_manual
 }
 
-# ------------- Menu -------------
-configure_notifications() {
-  banner "Email Notifications"
-  echo -e "Current: enabled=${yellow}${EMAIL_ENABLED}${plain}, to=${yellow}${EMAIL_TO}${plain}"
-  read -rp "Enable email notifications? [Y/n]: " yn
-  [[ -z "$yn" || "$yn" =~ ^[Yy]$ ]] && EMAIL_ENABLED="true" || EMAIL_ENABLED="false"
-
-  read -rp "Recipient email (press Enter to keep: ${EMAIL_TO}): " newmail
-  [[ -n "$newmail" ]] && EMAIL_TO="$newmail"
-
-  read -rp "Override IP/Host for access URL (blank = auto-detect, current: ${IP_OVERRIDE:-none}): " ipov
-  [[ -n "$ipov" ]] && IP_OVERRIDE="$ipov"
-
-  read -rp "Force tri-color banners? (1=yes, 0=no) [current: ${FORCE_TRI}]: " ft
-  [[ -n "$ft" ]] && FORCE_TRI="$ft"
-
-  save_config
-  tri_echo "Saved."
+# ------------- Shortcut installer -------------
+ensure_shortcuts() {
+  local wrapper="#!/bin/bash
+exec \"$(resolve_path "$SCRIPT_PATH")\" quick
+"
+  echo "$wrapper" > /usr/local/bin/jue-menu && chmod +x /usr/local/bin/jue-menu || true
+  # also place in /usr/bin for PATH variance
+  echo "$wrapper" > /usr/bin/jue-menu && chmod +x /usr/bin/jue-menu || true
 }
 
-smtp_tips() {
-cat <<'TIP'
-To enable emailing via Gmail:
-  1) Create an "App Password" in Google Account (Security > 2-Step Verification > App passwords).
-  2) Install msmtp (this script already tries to install).
-  3) Create /etc/msmtprc with:
-       defaults
-       auth           on
-       tls            on
-       tls_trust_file /etc/ssl/certs/ca-certificates.crt
-       logfile        /var/log/msmtp.log
-       account        gmail
-       host           smtp.gmail.com
-       port           587
-       from           YOUR_EMAIL@gmail.com
-       user           YOUR_EMAIL@gmail.com
-       passwordeval   "cat /root/.gmail_app_password"
-       account default : gmail
-     Put your 16-char app password into /root/.gmail_app_password with chmod 600.
-  4) Test:  echo "hi" | msmtp you@example.com
-TIP
+# ------------- Menus -------------
+configure_notifications() {
+  banner "Email & Misc Settings"
+  echo -e "Current: enabled=${EMAIL_ENABLED}, to=${EMAIL_TO}, IP_OVERRIDE=${IP_OVERRIDE:-none}"
+  read -rp "Enable email notifications? [Y/n]: " yn
+  [[ -z "$yn" || "$yn" =~ ^[Yy]$ ]] && EMAIL_ENABLED="true" || EMAIL_ENABLED="false"
+  read -rp "Recipient email (Enter=keep: ${EMAIL_TO}): " newmail; [[ -n "$newmail" ]] && EMAIL_TO="$newmail"
+  read -rp "Override IP/Host for access URL (blank=auto, current: ${IP_OVERRIDE:-none}): " ipov; [[ -n "$ipov" ]] && IP_OVERRIDE="$ipov"
+  save_config; tri_echo "Saved."
+}
+
+quick_menu() {
+  while true; do
+    clear; banner "jue-menu • Quick Credentials Menu"
+    echo "  1) Change credentials (NO reset)"
+    echo "  2) Legacy RESET (randomize)"
+    echo "  0) Exit"
+    echo
+    read -rp "Select: " opt
+    case "$opt" in
+      1) set_creds_no_reset ;;
+      2) reset_panel ;;
+      0) break ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
 }
 
 main_menu() {
-  clear
-  banner "x-ui Helper Menu (Tri-color • Manual Creds • Email Notify)"
-  echo -e "  1) Install / Update x-ui"
-  echo -e "  2) Change credentials (NO reset)"
-  echo -e "  3) Show current settings"
-  echo -e "  4) Configure notifications / override IP"
-  echo -e "  5) Email test (send dummy mail)"
-  echo -e "  6) Show SMTP setup tips"
-  echo -e "  7) Legacy RESET (randomize)"
-  echo -e "  0) Exit"
-  echo
-  read -rp "Select: " opt
-  case "$opt" in
-    1) install_base; install_xui ;;
-    2) set_creds_no_reset ;;
-    3) show_current_settings; read -rp "Press Enter..." ;;
-    4) configure_notifications ;;
-    5) send_mail "[x-ui] test from $(hostname)" "This is a test message at $(date -u)"; read -rp "Press Enter..." ;;
-    6) clear; smtp_tips; echo; read -rp "Press Enter..." ;;
-    7) reset_panel ;;
-    0) exit 0 ;;
-    *) echo "Invalid."; sleep 1 ;;
-  esac
-  main_menu
+  ensure_shortcuts
+  while true; do
+    clear; banner "x-ui Helper (Tri-color CLI • Manual Creds • Email Notify)"
+    echo "  1) Install / Update x-ui"
+    echo "  2) Change credentials (NO reset)"
+    echo "  3) Show current settings"
+    echo "  4) Configure notifications / override IP"
+    echo "  5) Email test (send dummy mail)"
+    echo "  6) Show SMTP setup tips"
+    echo "  7) Legacy RESET (randomize)"
+    echo "  8) Open Quick Menu (same as: jue-menu)"
+    echo "  0) Exit"
+    echo
+    read -rp "Select: " opt
+    case "$opt" in
+      1) install_base; install_xui ;;
+      2) set_creds_no_reset ;;
+      3) show_current_settings; read -rp "Press Enter..." ;;
+      4) configure_notifications ;;
+      5) send_mail "[x-ui] test from $(hostname)" "This is a test message at $(date -u)"; read -rp "Press Enter..." ;;
+      6) clear; cat <<'TIP'
+To enable emailing via Gmail:
+  1) Create an "App Password" in Google Account (Security > 2-Step Verification > App passwords).
+  2) Ensure msmtp is installed.
+  3) Create /etc/msmtprc and put app password in /root/.gmail_app_password (chmod 600).
+TIP
+         echo; read -rp "Press Enter..." ;;
+      7) reset_panel ;;
+      8) quick_menu ;;
+      0) break ;;
+      *) echo "Invalid."; sleep 1 ;;
+    esac
+  done
 }
 
 # ------------- Entrypoint -------------
-case "$1" in
+case "${1:-menu}" in
   install)    install_base; install_xui ;;
   set-cred)   set_creds_no_reset ;;
   reset)      reset_panel ;;
   email-test) send_mail "[x-ui] test from $(hostname)" "This is a test message at $(date -u)";;
-  menu|"")    main_menu ;;
-  *)          echo "Unknown command: $1"; exit 1 ;;
+  quick)      ensure_shortcuts; quick_menu ;;
+  menu|*)     main_menu ;;
 esac
